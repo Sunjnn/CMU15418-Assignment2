@@ -149,6 +149,26 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void findAdjacentSame(int* device_input, int length, int* device_output) {
+    extern __shared__ int smem[];
+
+    size_t global_idx = blockDim.x * blockIdx.x + threadIdx.x;
+
+    smem[threadIdx.x] = device_input[global_idx];
+    if (threadIdx.x == blockDim.x - 1)
+        smem[blockDim.x] = device_input[global_idx + 1];
+    __syncthreads();
+
+    device_output[global_idx] = (smem[threadIdx.x] == smem[threadIdx.x + 1]);
+}
+
+__global__ void setRepeats(int* device_idxs, int* device_same, int length, int* device_output) {
+    size_t id = blockDim.x * blockIdx.x + threadIdx.x;
+    if (device_same[id] == 1) {
+        device_output[device_idxs[id]] = id;
+    }
+}
+
 int find_repeats(int *device_input, int length, int *device_output) {
     /* Finds all pairs of adjacent repeated elements in the list, storing the
      * indices of the first element of each pair (in order) into device_result.
@@ -161,7 +181,27 @@ int find_repeats(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_repeats are correct given the original length.
      */    
-    return 0;
+    int *device_same;
+    int *device_idxs;
+    cudaMalloc(&device_same, nextPow2(length) * sizeof(int));
+    cudaMalloc(&device_idxs, nextPow2(length) * sizeof(int));
+
+    size_t blockDim = 256;
+    size_t gridDim = (length + blockDim - 1) / blockDim;
+    findAdjacentSame<<<gridDim, blockDim, (blockDim + 1) * sizeof(int)>>>(device_input, length, device_same);
+
+    cudaMemcpy(device_idxs, device_same, nextPow2(length) * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(device_input, length, device_idxs);
+
+    setRepeats<<<gridDim, blockDim>>>(device_idxs, device_same, length, device_output);
+
+    int count;
+    cudaMemcpy(&count, device_idxs + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(device_same);
+    cudaFree(device_idxs);
+
+    return count;
 }
 
 /* Timing wrapper around find_repeats. You should not modify this function.
