@@ -63,7 +63,7 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * power of 2 larger than the input.
      */
     length = nextPow2(length);
-    const int blockDim = 128;
+    const int blockDim = 256;
     const int gridDim  = (length + blockDim - 1) / blockDim;
 
     for (int twod = 1; twod < length; twod *= 2) {
