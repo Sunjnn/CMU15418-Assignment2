@@ -28,6 +28,29 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void upsweep(int* device_result, int N, int twod) {
+    size_t id = blockDim.x * blockIdx.x + threadIdx.x;
+    size_t twod1 = twod * 2;
+    size_t i = id * twod1;
+    if (i < N)
+        device_result[i + twod1 - 1] += device_result[i + twod - 1];
+}
+
+__global__ void downsweep(int* device_result, int N, int twod) {
+    size_t id = blockDim.x * blockIdx.x + threadIdx.x;
+    size_t twod1 = twod * 2;
+    size_t i = id * twod1;
+    if (i < N) {
+        int t = device_result[i + twod - 1];
+        device_result[i + twod - 1] = device_result[i + twod1 - 1];
+        device_result[i + twod1 - 1] += t;
+    }
+}
+
+__global__ void set(int* device_result, int N, int idx, int value) {
+    if (idx < N) device_result[idx] = value;
+}
+
 void exclusive_scan(int* device_start, int length, int* device_result)
 {
     /* Fill in this function with your exclusive scan implementation.
@@ -39,6 +62,19 @@ void exclusive_scan(int* device_start, int length, int* device_result)
      * both the input and the output arrays are sized to accommodate the next
      * power of 2 larger than the input.
      */
+    length = nextPow2(length);
+    const int blockDim = 128;
+    const int gridDim  = (length + blockDim - 1) / blockDim;
+
+    for (int twod = 1; twod < length; twod *= 2) {
+        upsweep<<<gridDim, blockDim>>>(device_result, length, twod);
+    }
+
+    set<<<1, 1>>>(device_result, length, length - 1, 0);
+
+    for (int twod = length / 2; twod >= 1; twod /= 2) {
+        downsweep<<<gridDim, blockDim>>>(device_result, length, twod);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -74,7 +110,7 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     exclusive_scan(device_input, end - inarray, device_result);
 
     // Wait for any work left over to be completed.
-    cudaThreadSynchronize();
+    cudaDeviceSynchronize();
     double endTime = CycleTimer::currentSeconds();
     double overallDuration = endTime - startTime;
     
@@ -102,7 +138,7 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 
     thrust::exclusive_scan(d_input, d_input + length, d_output);
 
-    cudaThreadSynchronize();
+    cudaDeviceSynchronize();
     double endTime = CycleTimer::currentSeconds();
 
     cudaMemcpy(resultarray, d_output.get(), length * sizeof(int),
@@ -143,7 +179,7 @@ double cudaFindRepeats(int *input, int length, int *output, int *output_length) 
     
     int result = find_repeats(device_input, length, device_output);
 
-    cudaThreadSynchronize();
+    cudaDeviceSynchronize();
     double endTime = CycleTimer::currentSeconds();
 
     *output_length = result;
