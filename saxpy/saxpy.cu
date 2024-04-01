@@ -73,7 +73,7 @@ saxpyCuda(int N, float alpha, float* xarray, float* yarray, float* resultarray) 
     //
     // TODO: copy result from GPU using cudaMemcpy
     //
-    cudaMemcpy(resultarray, device_result, sizeof(float) * N, cudaMemcpyHostToDevice);
+    cudaMemcpy(resultarray, device_result, sizeof(float) * N, cudaMemcpyDeviceToHost);
 
     // end timing after result has been copied back into host memory.
     // The time elapsed between startTime and endTime is the total
