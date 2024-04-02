@@ -8,6 +8,9 @@
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#define SCAN_BLOCK_DIM 256
+#include "exclusiveScan.cu_inl"
+
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
@@ -39,6 +42,11 @@ struct GlobalConstants {
 // about this type of memory in class, but constant memory is a fast
 // place to put read-only variables).
 __constant__ GlobalConstants cuConstRendererParams;
+// const int constant_size = 1024;
+// __constant__ float constant_position[3 * constant_size];
+// __constant__ float constant_velocity[3 * constant_size];
+// __constant__ float constant_color[3 * constant_size];
+// __constant__ float constant_radius[constant_size];
 
 // read-only lookup tables used to quickly compute noise (needed by
 // advanceAnimation for the snowflake scene)
@@ -50,6 +58,14 @@ __constant__ float  cuConstNoise1DValueTable[256];
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
+// shared memory
+const int smem_size = SCAN_BLOCK_DIM;
+__shared__ float smem_ps[smem_size * 3];
+__shared__ float smem_colors[smem_size * 3];
+__shared__ float smem_rads[smem_size];
+__shared__ uint smem_idxs[smem_size * 2];
+__shared__ uint smem_needs[smem_size];
+__shared__ uint smem_sums[smem_size];
 
 // including parts of the CUDA code from external files to keep this
 // file simpler and to seperate code that should not be modified
@@ -324,7 +340,8 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    // float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = smem_rads[circleIndex];
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -354,8 +371,9 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     } else {
         // simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        // int index3 = 3 * circleIndex;
+        // rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        rgb = ((float3*)smem_colors)[circleIndex];
         alpha = .5f;
     }
 
@@ -377,46 +395,160 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
+__device__ void upsweep(int* device_result, int N, int twod, size_t id) {
+    size_t twod1 = twod * 2;
+    size_t i = id * twod1;
+    if (i < N)
+        device_result[i + twod1 - 1] += device_result[i + twod - 1];
+}
+
+__device__ void downsweep(int* device_result, int N, int twod, size_t id) {
+    size_t twod1 = twod * 2;
+    size_t i = id * twod1;
+    if (i < N) {
+        int t = device_result[i + twod - 1];
+        device_result[i + twod - 1] = device_result[i + twod1 - 1];
+        device_result[i + twod1 - 1] += t;
+    }
+}
+
+__device__ inline void exclusiveScan(int* array, int size, int threadId) {
+    for (int twod = 1; twod < size; twod *= 2) {
+        upsweep(array, size, twod, threadId);
+        __syncthreads();
+    }
+
+    if (threadId == 0) smem_sums[size - 1] = 0;
+    __syncthreads();
+
+    for (int twod = size / 2; twod >= 1; twod /= 2) {
+        downsweep(array, size, twod, threadId);
+        __syncthreads();
+    }
+}
+
+__device__ int nextPow2(int n)
+{
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
+    float4 img;
 
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    const int threadId = threadIdx.y * blockDim.x + threadIdx.x;
 
-    for (int index = 0; index < cuConstRendererParams.numCircles; ++index) {
+    const unsigned int globalIdX = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int globalIdY = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const unsigned int x1 = blockIdx.x * blockDim.x;
+    const unsigned int x2 = x1 + blockDim.x;
+    const unsigned int y1 = blockIdx.y * blockDim.y;
+    const unsigned int y2 = y1 + blockDim.y;
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    // img = __ldcs((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX);
+    img = *((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX);
+
+    for (int index = 0; index < cuConstRendererParams.numCircles; index += smem_size) {
         int index3 = 3 * index;
+        int size = min(smem_size, cuConstRendererParams.numCircles - index);
 
-        // TODO: use shared memory to store positions and radius
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float  rad = cuConstRendererParams.radius[index];
+        __syncthreads();
+        if (threadId < size) {
+            smem_ps[threadId] = __ldca(&cuConstRendererParams.position[index3 + threadId]);
+            smem_ps[threadId + size] = __ldca(&cuConstRendererParams.position[index3 + threadId + size]);
+            smem_ps[threadId + size * 2] = __ldca(&cuConstRendererParams.position[index3 + threadId + size * 2]);
+            smem_rads[threadId] = __ldca(&cuConstRendererParams.radius[index + threadId]);
+            smem_colors[threadId] = __ldca(&cuConstRendererParams.color[index3 + threadId]);
+            smem_colors[threadId + size] = __ldca(&cuConstRendererParams.color[index3 + threadId + size]);
+            smem_colors[threadId + size * 2] = __ldca(&cuConstRendererParams.color[index3 + threadId + size * 2]);
+        }
+        __syncthreads();
 
-        short imageWidth = cuConstRendererParams.imageWidth;
-        short imageHeight = cuConstRendererParams.imageHeight;
-        short minX = static_cast<short>(imageWidth * (p.x - rad));
-        short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-        short minY = static_cast<short>(imageHeight * (p.y - rad));
-        short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+        int need_cal = 0;
 
-        short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-        short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-        short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-        short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+        if (threadId < size) {
 
-        float invWidth = 1.f / imageWidth;
-        float invHeight = 1.f / imageHeight;
+            float3 p = ((float3*)smem_ps)[threadId];
+            float rad = smem_rads[threadId];
 
-        if (pixelX < screenMinX || pixelX >= screenMaxX) continue;
-        if (pixelY < screenMinY || pixelY >= screenMaxY) continue;
+            short minX = static_cast<short>(imageWidth * (p.x - rad));
+            short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+            short minY = static_cast<short>(imageHeight * (p.y - rad));
+            short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-        float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                             invHeight * (static_cast<float>(pixelY) + 0.5f));
-        shadePixel(index, pixelCenterNorm, p, imgPtr);
+            short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+            short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+            short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+            short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+            need_cal = max(screenMaxX, x2) - min(screenMinX, x1) < x2 - x1 + screenMaxX - screenMinX &&
+                       max(screenMaxY, y2) - min(screenMinY, y1) < y2 - y1 + screenMaxY - screenMinY;
+        }
+
+        if (threadId < smem_size) {
+            smem_sums[threadId] = need_cal;
+            smem_needs[threadId] = need_cal;
+            smem_idxs[threadId] = 0;
+        }
+
+        __syncthreads();
+        size = nextPow2(size);
+
+        sharedMemExclusiveScan(threadId, smem_needs, smem_sums, smem_idxs, size);
+
+        if (smem_needs[threadId] == 1 && threadId < size) {
+            smem_idxs[smem_sums[threadId]] = threadId;
+        }
+        __syncthreads();
+
+        size = smem_sums[size - 1] + smem_needs[size - 1];
+
+        for (int i = 0; i < size; ++i) {
+            float3 p = ((float3*)smem_ps)[smem_idxs[i]];
+            float rad = smem_rads[smem_idxs[i]];
+            // float3 p = ((float3*)smem_ps)[i];
+            // float rad = smem_rads[i];
+
+            short minX = static_cast<short>(imageWidth * (p.x - rad));
+            short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+            short minY = static_cast<short>(imageHeight * (p.y - rad));
+            short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+            short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+            short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+            short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+            short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+            float invWidth = 1.f / imageWidth;
+            float invHeight = 1.f / imageHeight;
+
+            if (globalIdX < screenMinX || globalIdX >= screenMaxX) continue;
+            if (globalIdY < screenMinY || globalIdY >= screenMaxY) continue;
+            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(globalIdX) + 0.5f),
+                                                 invHeight * (static_cast<float>(globalIdY) + 0.5f));
+            shadePixel(smem_idxs[i], pixelCenterNorm, p, &img);
+        }
+
     }
+
+
+    *((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX) = img;
+    // __stwt((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX, img);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -636,7 +768,13 @@ CudaRenderer::render() {
     // 256 threads per block is a healthy number
     dim3 blockDim(16, 16);
     dim3 gridDim(didUp(image->width, blockDim.x), didUp(image->height, blockDim.y));
+    // dim3 gridDim(1, 1);
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
+    // printf("check cuda error\n");
+    // cudaError_t err = cudaDeviceSynchronize();
+    // if (err != cudaSuccess) {
+        // printf("%s\n", cudaGetErrorString(err));
+    // }
 }
