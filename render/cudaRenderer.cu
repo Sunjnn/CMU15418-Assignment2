@@ -10,6 +10,7 @@
 
 #define SCAN_BLOCK_DIM 256
 #include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 #include "cudaRenderer.h"
 #include "image.h"
@@ -60,10 +61,9 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
 // shared memory
 const int smem_size = SCAN_BLOCK_DIM;
-__shared__ float smem_ps[smem_size * 3];
-__shared__ float smem_colors[smem_size * 3];
-__shared__ float smem_rads[smem_size];
-__shared__ uint smem_idxs[smem_size * 2];
+__shared__ float4 smem_p_rad[smem_size];
+__shared__ float3 smem_colors[smem_size];
+__shared__ uint smem_scan_scratch[smem_size * 2];
 __shared__ uint smem_needs[smem_size];
 __shared__ uint smem_sums[smem_size];
 
@@ -334,14 +334,14 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixel(int circleIndex, float2 pixelCenter, float4 p_rad, float4* imagePtr) {
 
-    float diffX = p.x - pixelCenter.x;
-    float diffY = p.y - pixelCenter.y;
+    float diffX = p_rad.x - pixelCenter.x;
+    float diffY = p_rad.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
     // float rad = cuConstRendererParams.radius[circleIndex];;
-    float rad = smem_rads[circleIndex];
+    float rad = p_rad.w;
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -365,7 +365,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         float normPixelDist = sqrt(pixelDist) / rad;
         rgb = lookupColor(normPixelDist);
 
-        float maxAlpha = .6f + .4f * (1.f-p.z);
+        float maxAlpha = .6f + .4f * (1.f-p_rad.z);
         maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
 
@@ -373,7 +373,7 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
         // simple: each circle has an assigned color
         // int index3 = 3 * circleIndex;
         // rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-        rgb = ((float3*)smem_colors)[circleIndex];
+        rgb = smem_colors[circleIndex];
         alpha = .5f;
     }
 
@@ -459,96 +459,68 @@ __global__ void kernelRenderCircles() {
 
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
 
-    // img = __ldcs((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX);
-    img = *((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX);
+    int offset = 0;
+
+    img = __ldcs((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX);
 
     for (int index = 0; index < cuConstRendererParams.numCircles; index += smem_size) {
-        int index3 = 3 * index;
         int size = min(smem_size, cuConstRendererParams.numCircles - index);
-
-        __syncthreads();
-        if (threadId < size) {
-            smem_ps[threadId] = __ldca(&cuConstRendererParams.position[index3 + threadId]);
-            smem_ps[threadId + size] = __ldca(&cuConstRendererParams.position[index3 + threadId + size]);
-            smem_ps[threadId + size * 2] = __ldca(&cuConstRendererParams.position[index3 + threadId + size * 2]);
-            smem_rads[threadId] = __ldca(&cuConstRendererParams.radius[index + threadId]);
-            smem_colors[threadId] = __ldca(&cuConstRendererParams.color[index3 + threadId]);
-            smem_colors[threadId + size] = __ldca(&cuConstRendererParams.color[index3 + threadId + size]);
-            smem_colors[threadId + size * 2] = __ldca(&cuConstRendererParams.color[index3 + threadId + size * 2]);
-        }
-        __syncthreads();
-
         int need_cal = 0;
 
+        float3 p = *((float3*)cuConstRendererParams.position + index + threadId);
+        float3 color = *((float3*)cuConstRendererParams.color + index + threadId);
+        float rad = *(cuConstRendererParams.radius + index + threadId);
+
         if (threadId < size) {
-
-            float3 p = ((float3*)smem_ps)[threadId];
-            float rad = smem_rads[threadId];
-
-            short minX = static_cast<short>(imageWidth * (p.x - rad));
-            short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-            short minY = static_cast<short>(imageHeight * (p.y - rad));
-            short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-            short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-            short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-            short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-            short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-            need_cal = max(screenMaxX, x2) - min(screenMinX, x1) < x2 - x1 + screenMaxX - screenMinX &&
-                       max(screenMaxY, y2) - min(screenMinY, y1) < y2 - y1 + screenMaxY - screenMinY;
+            need_cal = circleInBoxConservative(p.x, p.y, rad, x1 * invWidth, x2 * invWidth, y2 * invHeight, y1 * invHeight);
         }
 
         if (threadId < smem_size) {
             smem_sums[threadId] = need_cal;
             smem_needs[threadId] = need_cal;
-            smem_idxs[threadId] = 0;
         }
 
         __syncthreads();
         size = nextPow2(size);
 
-        sharedMemExclusiveScan(threadId, smem_needs, smem_sums, smem_idxs, size);
-
-        if (smem_needs[threadId] == 1 && threadId < size) {
-            smem_idxs[smem_sums[threadId]] = threadId;
-        }
+        sharedMemExclusiveScan(threadId, smem_needs, smem_sums, smem_scan_scratch, size);
         __syncthreads();
-
         size = smem_sums[size - 1] + smem_needs[size - 1];
+        if (offset + size > smem_size) {
+            for (int i = 0; i < offset; ++i) {
+                float4 p_rad = smem_p_rad[i];
+    
+                float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(globalIdX) + 0.5f),
+                                                     invHeight * (static_cast<float>(globalIdY) + 0.5f));
+                shadePixel(i, pixelCenterNorm, p_rad, &img);
+            }
 
-        for (int i = 0; i < size; ++i) {
-            float3 p = ((float3*)smem_ps)[smem_idxs[i]];
-            float rad = smem_rads[smem_idxs[i]];
-            // float3 p = ((float3*)smem_ps)[i];
-            // float rad = smem_rads[i];
-
-            short minX = static_cast<short>(imageWidth * (p.x - rad));
-            short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-            short minY = static_cast<short>(imageHeight * (p.y - rad));
-            short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-            short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-            short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-            short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-            short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-            float invWidth = 1.f / imageWidth;
-            float invHeight = 1.f / imageHeight;
-
-            if (globalIdX < screenMinX || globalIdX >= screenMaxX) continue;
-            if (globalIdY < screenMinY || globalIdY >= screenMaxY) continue;
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(globalIdX) + 0.5f),
-                                                 invHeight * (static_cast<float>(globalIdY) + 0.5f));
-            shadePixel(smem_idxs[i], pixelCenterNorm, p, &img);
+            offset = 0;
         }
 
+        __syncthreads();
+        if (smem_needs[threadId] == 1 && threadId < smem_size) {
+            smem_p_rad[smem_sums[threadId] + offset] = make_float4(p.x, p.y, p.z, rad);
+            smem_colors[smem_sums[threadId] + offset] = color;
+        }
+        offset += size;
     }
 
+    if (offset) {
+        __syncthreads();
+        for (int i = 0; i < offset; ++i) {
+            float4 p_rad = smem_p_rad[i];
 
-    *((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX) = img;
-    // __stwt((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX, img);
+            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(globalIdX) + 0.5f),
+                                                 invHeight * (static_cast<float>(globalIdY) + 0.5f));
+            shadePixel(i, pixelCenterNorm, p_rad, &img);
+        }
+    }
+
+    __stwt((float4*)(cuConstRendererParams.imageData) + globalIdY * imageWidth + globalIdX, img);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
