@@ -438,11 +438,14 @@ __global__ void kernelRenderCircles() {
         int size = min(smem_size, cuConstRendererParams.numCircles - index);
         int need_cal = 0;
 
-        float3 p = *((float3*)cuConstRendererParams.position + index + threadId);
-        float3 color = *((float3*)cuConstRendererParams.color + index + threadId);
-        float rad = *(cuConstRendererParams.radius + index + threadId);
+        float3 p, color;
+        float rad;
 
         if (threadId < size) {
+            p = *((float3*)cuConstRendererParams.position + index + threadId);
+            color = *((float3*)cuConstRendererParams.color + index + threadId);
+            rad = *(cuConstRendererParams.radius + index + threadId);
+
             need_cal = circleInBoxConservative(p.x, p.y, rad, x1 * invWidth, x2 * invWidth, y2 * invHeight, y1 * invHeight);
         }
 
