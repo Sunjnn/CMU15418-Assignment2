@@ -395,38 +395,6 @@ shadePixel(int circleIndex, float2 pixelCenter, float4 p_rad, float4* imagePtr) 
     // END SHOULD-BE-ATOMIC REGION
 }
 
-__device__ void upsweep(int* device_result, int N, int twod, size_t id) {
-    size_t twod1 = twod * 2;
-    size_t i = id * twod1;
-    if (i < N)
-        device_result[i + twod1 - 1] += device_result[i + twod - 1];
-}
-
-__device__ void downsweep(int* device_result, int N, int twod, size_t id) {
-    size_t twod1 = twod * 2;
-    size_t i = id * twod1;
-    if (i < N) {
-        int t = device_result[i + twod - 1];
-        device_result[i + twod - 1] = device_result[i + twod1 - 1];
-        device_result[i + twod1 - 1] += t;
-    }
-}
-
-__device__ inline void exclusiveScan(int* array, int size, int threadId) {
-    for (int twod = 1; twod < size; twod *= 2) {
-        upsweep(array, size, twod, threadId);
-        __syncthreads();
-    }
-
-    if (threadId == 0) smem_sums[size - 1] = 0;
-    __syncthreads();
-
-    for (int twod = size / 2; twod >= 1; twod /= 2) {
-        downsweep(array, size, twod, threadId);
-        __syncthreads();
-    }
-}
-
 __device__ int nextPow2(int n)
 {
     n--;
